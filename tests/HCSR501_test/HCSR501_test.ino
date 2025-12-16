@@ -3,7 +3,7 @@
 
 // Set GPIOs for LED and PIR Motion Sensor
 const uint8_t led = 26;
-const uint8_t motionSensor = 27;
+const uint8_t motionSensor = 14;
 
 // Timer: Auxiliary variables
 unsigned long now;

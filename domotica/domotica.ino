@@ -1,18 +1,19 @@
 #include <PubSubClient.h>
 #include <WiFi.h>
 #include <Adafruit_NeoPixel.h>
+#include "DHT.h"
 
 // ====== Configuración WiFi ======
-const char* WIFI_SSID = "Gaby";
-const char* WIFI_PASS = "1234hola";
+const char* WIFI_SSID = "galileo";
+const char* WIFI_PASS = "";
 
 // ====== Configuración MQTT ======
 const char* mqttServer = "test.mosquitto.org";
 const uint16_t mqttPort = 1883;
 
-const char* mqttClientId = "esp32-neopixel-rod"; // pon algo único
-const char* mqttUser     = "";
-const char* mqttPass     = "";
+const char* mqttClientId = "esp32-neopixel-rod";
+const char* mqttUser = "";
+const char* mqttPass = "";
 
 const char* topicOut = "teslalab";
 const char* topicIn  = "teslalab/commands";
@@ -25,18 +26,43 @@ PubSubClient client(wifiClient);
 #define NUMPIXELS 16
 Adafruit_NeoPixel pixels(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
 
+// ====== Temperature conf ======
+#define DHTPIN 27
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// ====== PIR conf ======
+const uint8_t motionSensor = 14;
+unsigned long now;
+
+// ✅ PIR enable/disable por MQTT
+bool pirEnabled = false;
+
+// Timer: Auxiliary variables
+volatile unsigned long lastTrigger = 0;
+volatile bool startTimer = false;
+bool printMotion = false;
+
+const unsigned long timeSeconds = 5 * 1000UL;  // 5 seconds
+
+void ARDUINO_ISR_ATTR motionISR() {
+  lastTrigger = millis();
+  startTimer = true;
+}
+
 // ====== Modos ======
-enum Mode { MODE_OFF, MODE_WARM, MODE_PARTY, MODE_WHITE };
+enum Mode { MODE_OFF, MODE_WARM, MODE_PARTY, MODE_WHITE, MODE_WARNING };
 Mode currentMode = MODE_OFF;
 
 // ====== Party animation state ======
 unsigned long lastPartyUpdate = 0;
 uint8_t partyIndex = 0;
-const unsigned long partyDelayMs = 40; // velocidad de la secuencia
+const unsigned long partyDelayMs = 40;
 
 // Colores
-uint32_t WARM_YELLOW() { return pixels.Color(255, 160, 40); }   // amarillo cálido
-uint32_t FULL_WHITE()  { return pixels.Color(255, 255, 255); }  // blanco total
+uint32_t WARM_YELLOW() { return pixels.Color(255, 160, 40); }
+uint32_t FULL_WHITE()  { return pixels.Color(255, 255, 255); }
+uint32_t WARNING()     { return pixels.Color(255, 0, 0); }
 
 void setOff() {
   currentMode = MODE_OFF;
@@ -56,16 +82,45 @@ void setWhite() {
   pixels.show();
 }
 
-// Rueda de colores para modo fiesta (tipo rainbow)
+void setWarning() {
+  currentMode = MODE_WARNING;
+  pixels.fill(WARNING(), 0, NUMPIXELS);
+  pixels.show();
+}
+
+// ✅ Attach/Detach interrupt (van aquí para evitar el error)
+void enablePIR() {
+  if (pirEnabled) return;
+  pirEnabled = true;
+
+  startTimer = false;
+  printMotion = false;
+  lastTrigger = millis();
+
+  attachInterrupt(digitalPinToInterrupt(motionSensor), motionISR, RISING);
+  Serial.println("PIR ENABLED (interrupt attached)");
+}
+
+void disablePIR() {
+  if (!pirEnabled) return;
+  pirEnabled = false;
+
+  detachInterrupt(digitalPinToInterrupt(motionSensor));
+
+  startTimer = false;
+  printMotion = false;
+
+  Serial.println("PIR DISABLED (interrupt detached)");
+
+  // si estaba en warning por PIR, apaga (si temp está alta, luego vuelve a warning)
+  if (currentMode == MODE_WARNING) setOff();
+}
+
+// Party color wheel
 uint32_t wheel(uint8_t pos) {
   pos = 255 - pos;
-  if (pos < 85) {
-    return pixels.Color(255 - pos * 3, 0, pos * 3);
-  }
-  if (pos < 170) {
-    pos -= 85;
-    return pixels.Color(0, pos * 3, 255 - pos * 3);
-  }
+  if (pos < 85) return pixels.Color(255 - pos * 3, 0, pos * 3);
+  if (pos < 170) { pos -= 85; return pixels.Color(0, pos * 3, 255 - pos * 3); }
   pos -= 170;
   return pixels.Color(pos * 3, 255 - pos * 3, 0);
 }
@@ -73,7 +128,7 @@ uint32_t wheel(uint8_t pos) {
 void setParty() {
   currentMode = MODE_PARTY;
   partyIndex = 0;
-  lastPartyUpdate = 0; // para que arranque de inmediato en loop
+  lastPartyUpdate = 0;
 }
 
 void updateParty() {
@@ -81,37 +136,41 @@ void updateParty() {
   if (now - lastPartyUpdate < partyDelayMs) return;
   lastPartyUpdate = now;
 
-  for (int i = 0; i < NUMPIXELS; i++) {
-    uint8_t c = (uint8_t)((i * 256 / NUMPIXELS + partyIndex) & 255);
-    pixels.setPixelColor(i, wheel(c));
-  }
+  // todos cambian juntos
+  pixels.fill(wheel(partyIndex), 0, NUMPIXELS);
   pixels.show();
-  partyIndex++;
+  partyIndex += 10;
 }
 
 void handleCommands(int command) {
-  switch (command) {
-    case 1:
-      // Toggle amarillo cálido
-      if (currentMode == MODE_WARM) setOff();
-      else setWarm();
-      break;
+  // ✅ Case 4 SIEMPRE permitido (toggle PIR)
+  if (command == 4) {
+    if (pirEnabled) disablePIR();
+    else enablePIR();
+    return;
+  }
 
-    case 2:
-      // Secuencia de fiesta
-      if (currentMode == MODE_PARTY) setOff();
-      else setParty();
-      break;
+  if (currentMode != MODE_WARNING) {
+    switch (command) {
+      case 1:
+        if (currentMode == MODE_WARM) setOff();
+        else setWarm();
+        break;
 
-    case 3:
-      if (currentMode == MODE_WHITE) setOff();
-      else setWhite();
-      break;
+      case 2:
+        if (currentMode == MODE_PARTY) setOff();
+        else setParty();
+        break;
 
-    default:
-      // Si llega algo raro, apaga
-      setOff();
-      break;
+      case 3:
+        if (currentMode == MODE_WHITE) setOff();
+        else setWhite();
+        break;
+
+      default:
+        setOff();
+        break;
+    }
   }
 }
 
@@ -127,7 +186,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
   Serial.println(command);
 
-  int cmd = atoi(command);   // asume número
+  int cmd = atoi(command);
   handleCommands(cmd);
 }
 
@@ -167,13 +226,18 @@ void setup() {
   delay(100);
 
   pixels.begin();
-  setOff();
+  dht.begin();
 
+  pinMode(motionSensor, INPUT_PULLUP);
+
+  // ✅ PIR apagado por defecto: NO attachInterrupt aquí
+  pirEnabled = false;
+
+  setOff();
   connectWiFi();
 
   client.setServer(mqttServer, mqttPort);
   client.setCallback(callback);
-
   reconnectMQTT();
 }
 
@@ -182,8 +246,39 @@ void loop() {
   if (!client.connected()) reconnectMQTT();
   client.loop();
 
-  // Animación no bloqueante si estamos en modo fiesta
+  now = millis();
+
+  // ====== PIR -> WARNING_MODE SOLO si está habilitado ======
+  if (pirEnabled) {
+    if (startTimer && !printMotion) {
+      Serial.println("MOTION DETECTED!!!");
+      printMotion = true;
+      setWarning();
+    }
+
+    if (startTimer && (now - lastTrigger > timeSeconds)) {
+      Serial.println("Motion stopped...");
+      startTimer = false;
+      printMotion = false;
+
+      if (currentMode == MODE_WARNING) setOff();
+    }
+  }
+
   if (currentMode == MODE_PARTY) {
     updateParty();
+  }
+
+  float t = dht.readTemperature();
+  if (!isnan(t) && t > 30) {
+    Serial.println("WARNING: La temperatura sobrepaso los 30°C");
+    Serial.print("Temperature: ");
+    Serial.print(t);
+    Serial.print("\n");
+    setWarning();
+  } else {
+    if (currentMode == MODE_WARNING && !startTimer) {
+      setOff();
+    }
   }
 }
